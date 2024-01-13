@@ -205,8 +205,6 @@ async def test_process_aexit_cancellation_closes_standard_streams() -> None:
     closed stream.
 
     """
-    pytest.xfail("#671 needs to be resolved first")
-
     with CancelScope() as scope:
         async with await open_process(
             [sys.executable, "-c", "import time; time.sleep(1)"]
