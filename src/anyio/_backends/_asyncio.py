@@ -908,15 +908,19 @@ class BlockingPortal(abc.BlockingPortal):
 @dataclass(eq=False)
 class StreamReaderWrapper(abc.ByteReceiveStream):
     _stream: asyncio.StreamReader
+    _closed_by_anyone = False
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
         data = await self._stream.read(max_bytes)
         if data:
             return data
         else:
+            if self._closed_by_anyone:
+                raise ClosedResourceError
             raise EndOfStream
 
     async def aclose(self) -> None:
+        self._closed_by_anyone = True
         self._stream.feed_eof()
         await AsyncIOBackend.checkpoint()
 
