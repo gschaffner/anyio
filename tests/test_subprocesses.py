@@ -9,7 +9,14 @@ from textwrap import dedent
 
 import pytest
 
-from anyio import CancelScope, ClosedResourceError, open_process, run_process
+from anyio import (
+    BrokenResourceError,
+    CancelScope,
+    ClosedResourceError,
+    EndOfStream,
+    open_process,
+    run_process,
+)
 from anyio.streams.buffered import BufferedByteReceiveStream
 
 pytestmark = pytest.mark.anyio
@@ -218,5 +225,26 @@ async def test_process_aexit_cancellation_closes_standard_streams() -> None:
     with pytest.raises(ClosedResourceError):
         await process.stdout.receive(1)
     assert process.stderr is not None
+    with pytest.raises(ClosedResourceError):
+        await process.stderr.receive(1)
+
+
+async def test_exceptions_after_subprocess_closes_standard_streams() -> None:
+    async with await open_process([sys.executable, "-c", ""]) as process:
+        await process.wait()
+        assert process.stdin is not None
+        assert process.stderr is not None
+        assert process.stdout is not None
+        with pytest.raises(BrokenResourceError):
+            await process.stdin.send(b"foo")
+        with pytest.raises(EndOfStream):
+            await process.stdout.receive(1)
+        with pytest.raises(EndOfStream):
+            await process.stderr.receive(1)
+
+    with pytest.raises(BrokenResourceError):
+        await process.stdin.send(b"foo")
+    with pytest.raises(ClosedResourceError):
+        await process.stdout.receive(1)
     with pytest.raises(ClosedResourceError):
         await process.stderr.receive(1)
