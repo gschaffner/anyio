@@ -924,13 +924,26 @@ class StreamReaderWrapper(abc.ByteReceiveStream):
 @dataclass(eq=False)
 class StreamWriterWrapper(abc.ByteSendStream):
     _stream: asyncio.StreamWriter
+    _closed = False
 
     async def send(self, item: bytes) -> None:
-        self._stream.write(item)
-        await self._stream.drain()
+        try:
+            self._stream.write(item)
+            await self._stream.drain()
+        except (ConnectionResetError, RuntimeError) as exc:
+            # If closed by either us or the peer:
+            # * on stdlib, drain() raises ConnectionResetError
+            # * on uvloop, write() raises RuntimeError
+            if self._closed:
+                raise ClosedResourceError from exc.__cause__
+            if self._stream.is_closing():
+                raise BrokenResourceError from exc.__cause__
+            raise
 
     async def aclose(self) -> None:
-        self._stream.close()
+        if not self._stream.is_closing():
+            self._closed = True
+            self._stream.close()
         await AsyncIOBackend.checkpoint()
 
 
