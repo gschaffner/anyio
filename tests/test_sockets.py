@@ -28,6 +28,7 @@ from anyio import (
     BrokenResourceError,
     BusyResourceError,
     ClosedResourceError,
+    EndOfStream,
     Event,
     TypedAttributeLookupError,
     connect_tcp,
@@ -397,6 +398,29 @@ class TestTCPStream:
         with pytest.raises(ClosedResourceError):
             await stream.send(b"foo")
 
+    async def test_receive_after_peer_closed(self, family: AnyIPAddressFamily) -> None:
+        def serve_once() -> None:
+            client_sock, _ = server_sock.accept()
+            client_sock.close()
+            server_sock.close()
+
+        server_sock = socket.socket(family, socket.SOCK_STREAM)
+        server_sock.settimeout(1)
+        server_sock.bind(("localhost", 0))
+        server_addr = server_sock.getsockname()[:2]
+        server_sock.listen()
+        thread = Thread(target=serve_once, daemon=True)
+        thread.start()
+
+        async with await connect_tcp(*server_addr) as stream:
+            with pytest.raises(EndOfStream):
+                await stream.receive(1)
+
+        with pytest.raises(ClosedResourceError):
+            await stream.receive(1)
+
+        thread.join()
+
     async def test_send_after_peer_closed(self, family: AnyIPAddressFamily) -> None:
         def serve_once() -> None:
             client_sock, _ = server_sock.accept()
@@ -411,10 +435,13 @@ class TestTCPStream:
         thread = Thread(target=serve_once, daemon=True)
         thread.start()
 
-        with pytest.raises(BrokenResourceError):
-            async with await connect_tcp(*server_addr) as stream:
+        async with await connect_tcp(*server_addr) as stream:
+            with pytest.raises(BrokenResourceError):
                 for _ in range(1000):
                     await stream.send(b"foo")
+
+        with pytest.raises(BrokenResourceError):
+            await stream.send(b"foo")
 
         thread.join()
 
