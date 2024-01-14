@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import array
 import math
+import os
+import select
 import socket
 import sys
 import types
@@ -16,6 +18,7 @@ from socket import AddressFamily, SocketKind
 from types import TracebackType
 from typing import (
     IO,
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Awaitable,
@@ -34,6 +37,7 @@ from typing import (
 
 import trio.from_thread
 import trio.lowlevel
+import trio.socket
 from outcome import Error, Outcome, Value
 from trio.lowlevel import (
     current_root_task,
@@ -262,17 +266,73 @@ class ReceiveStreamWrapper(abc.ByteReceiveStream):
 @dataclass(eq=False)
 class SendStreamWrapper(abc.ByteSendStream):
     _stream: trio.abc.SendStream
+    _closed = False
 
     async def send(self, item: bytes) -> None:
         try:
             await self._stream.send_all(item)
-        except trio.ClosedResourceError as exc:
-            raise ClosedResourceError from exc.__cause__
-        except trio.BrokenResourceError as exc:
-            raise BrokenResourceError from exc.__cause__
+        except (trio.ClosedResourceError, trio.BrokenResourceError) as exc:
+            if self._closed:
+                raise ClosedResourceError from exc.__cause__
+            else:
+                raise BrokenResourceError from exc.__cause__
 
     async def aclose(self) -> None:
+        if not self._closed_by_us_or_peer():
+            self._closed = True
         await self._stream.aclose()
+
+    def _closed_by_us_or_peer(self) -> bool:
+        # Trio doesn't provide us API to detect when the peer closes their end of the
+        # pipe, so we'll detect this by using private Trio API and the technique used by
+        # asyncio: our end of the pipe becomes readable when the peer closes their end.
+        # See asyncio.unix_events._UnixWritePipeTransport._read_ready/
+        # asyncio.proactor_events._ProactorWritePipeTransport.__init__.
+        return self._closed or self._is_readable()
+
+    if TYPE_CHECKING:
+
+        def _is_readable(self) -> bool:
+            raise NotImplementedError
+
+    elif os.name == "posix":
+
+        def _is_readable(self) -> bool:
+            # Copied from trio._socket._SocketType because trio.socket.fromfd doesn't
+            # support pipes.
+            poll = select.poll()
+            poll.register(self._get_read_fd(), select.POLLIN)
+            return bool(poll.poll(0))
+
+        def _get_read_fd(self) -> int:
+            return cast(trio.lowlevel.FdStream, self._stream)._fd_holder.fd
+
+    elif os.name == "nt":
+        import msvcrt
+
+        import trio._windows_pipes
+
+        def _is_readable(self) -> bool:
+            r_ready, _, _ = select.select([self._get_read_fd()], [], [], 0)
+            return bool(r_ready)
+
+        def _get_read_fd(self) -> int:
+            handle = cast(
+                trio._windows_pipes.PipeReceiveStream
+                | trio._windows_pipes.PipeSendStream,
+                self._stream,
+            )._handle_holder.handle
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY)  # noqa: F821
+
+        # TODO: Unfortunately, this technique probably will not work on Windows (I have
+        # not tested on Windows yet) because, while can we use select.select() on
+        # Windows in place of select.poll(), on Windows select.select() only works on
+        # sockets. We probably need to use OVERLAPPED, because Trio set up the handle in
+        # OVERLAPPED mode.
+    else:
+        # Trio does not support pipes on other platforms. Ideally we'd raise here for
+        # safty but doing so would crash the whole module.
+        pass
 
 
 @dataclass(eq=False)

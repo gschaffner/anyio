@@ -27,7 +27,7 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   - Fixed ``Process.stdin.send()``, ``Process.stdout.receive()``, and
     ``Process.stderr.receive()`` not raising ``ClosedResourceError`` on asyncio when
     called on closed streams
-  - Fixed ``Process.stdin.send()`` not raising ``BrokenResourceError`` on asyncio when
+  - Fixed ``Process.stdin.send()`` not raising ``BrokenResourceError`` when
     ``Process.stdin.aclose()`` was called after the subprocess closed its standard
     input.
   - Fixed various other streams on Trio nor raising ``BrokenResourceError`` after being
