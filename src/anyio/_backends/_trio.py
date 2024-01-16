@@ -364,6 +364,7 @@ class _TrioSocketMixin(Generic[T_SockAddr]):
     def __init__(self, trio_socket: TrioSocketType) -> None:
         self._trio_socket = trio_socket
         self._closed = False
+        self._closed_by_us_or_peer = False
 
     def _check_closed(self) -> None:
         if self._closed:
@@ -376,17 +377,32 @@ class _TrioSocketMixin(Generic[T_SockAddr]):
         return self._trio_socket._sock  # type: ignore[attr-defined]
 
     async def aclose(self) -> None:
-        if self._trio_socket.fileno() >= 0:
-            self._closed = True
+        if not self._closed_by_us_or_peer:
+            if not self._trio_socket.is_readable():
+                # Not closed already by the peer, so closed by us.
+                self._closed = True
+            self._closed_by_us_or_peer = True
             self._trio_socket.close()
 
-    def _convert_socket_error(self, exc: BaseException) -> NoReturn:
-        if isinstance(exc, trio.ClosedResourceError):
-            raise ClosedResourceError from exc
-        elif self._trio_socket.fileno() < 0 and self._closed:
-            raise ClosedResourceError from None
-        elif isinstance(exc, OSError):
-            raise BrokenResourceError from exc
+    def _convert_socket_receive_error(self, exc: BaseException) -> NoReturn:
+        if isinstance(
+            exc, (trio.ClosedResourceError, trio.BrokenResourceError, OSError)
+        ):
+            if self._closed_by_us_or_peer:
+                raise ClosedResourceError from exc
+            else:
+                raise BrokenResourceError from exc
+        else:
+            raise exc
+
+    def _convert_socket_send_error(self, exc: BaseException) -> NoReturn:
+        if isinstance(
+            exc, (trio.ClosedResourceError, trio.BrokenResourceError, OSError)
+        ):
+            if self._closed:
+                raise ClosedResourceError from exc
+            else:
+                raise BrokenResourceError from exc
         else:
             raise exc
 
@@ -402,7 +418,7 @@ class SocketStream(_TrioSocketMixin, abc.SocketStream):
             try:
                 data = await self._trio_socket.recv(max_bytes)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
             if data:
                 return data
@@ -416,7 +432,7 @@ class SocketStream(_TrioSocketMixin, abc.SocketStream):
                 try:
                     bytes_sent = await self._trio_socket.send(view)
                 except BaseException as exc:
-                    self._convert_socket_error(exc)
+                    self._convert_socket_send_error(exc)
 
                 view = view[bytes_sent:]
 
@@ -440,7 +456,7 @@ class UNIXSocketStream(SocketStream, abc.UNIXSocketStream):
                         msglen, socket.CMSG_LEN(maxfds * fds.itemsize)
                     )
                 except BaseException as exc:
-                    self._convert_socket_error(exc)
+                    self._convert_socket_receive_error(exc)
                 else:
                     if not message and not ancdata:
                         raise EndOfStream
@@ -488,7 +504,7 @@ class UNIXSocketStream(SocketStream, abc.UNIXSocketStream):
                     )
                     break
                 except BaseException as exc:
-                    self._convert_socket_error(exc)
+                    self._convert_socket_send_error(exc)
 
 
 class TCPSocketListener(_TrioSocketMixin, abc.SocketListener):
@@ -501,7 +517,7 @@ class TCPSocketListener(_TrioSocketMixin, abc.SocketListener):
             try:
                 trio_socket, _addr = await self._trio_socket.accept()
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
         trio_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return SocketStream(trio_socket)
@@ -517,7 +533,7 @@ class UNIXSocketListener(_TrioSocketMixin, abc.SocketListener):
             try:
                 trio_socket, _addr = await self._trio_socket.accept()
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
         return UNIXSocketStream(trio_socket)
 
@@ -534,14 +550,14 @@ class UDPSocket(_TrioSocketMixin[IPSockAddrType], abc.UDPSocket):
                 data, addr = await self._trio_socket.recvfrom(65536)
                 return data, convert_ipv6_sockaddr(addr)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
     async def send(self, item: UDPPacketType) -> None:
         with self._send_guard:
             try:
                 await self._trio_socket.sendto(*item)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_send_error(exc)
 
 
 class ConnectedUDPSocket(_TrioSocketMixin[IPSockAddrType], abc.ConnectedUDPSocket):
@@ -555,14 +571,14 @@ class ConnectedUDPSocket(_TrioSocketMixin[IPSockAddrType], abc.ConnectedUDPSocke
             try:
                 return await self._trio_socket.recv(65536)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
     async def send(self, item: bytes) -> None:
         with self._send_guard:
             try:
                 await self._trio_socket.send(item)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_send_error(exc)
 
 
 class UNIXDatagramSocket(_TrioSocketMixin[str], abc.UNIXDatagramSocket):
@@ -577,14 +593,14 @@ class UNIXDatagramSocket(_TrioSocketMixin[str], abc.UNIXDatagramSocket):
                 data, addr = await self._trio_socket.recvfrom(65536)
                 return data, addr
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
     async def send(self, item: UNIXDatagramPacketType) -> None:
         with self._send_guard:
             try:
                 await self._trio_socket.sendto(*item)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_send_error(exc)
 
 
 class ConnectedUNIXDatagramSocket(
@@ -600,14 +616,14 @@ class ConnectedUNIXDatagramSocket(
             try:
                 return await self._trio_socket.recv(65536)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_receive_error(exc)
 
     async def send(self, item: bytes) -> None:
         with self._send_guard:
             try:
                 await self._trio_socket.send(item)
             except BaseException as exc:
-                self._convert_socket_error(exc)
+                self._convert_socket_send_error(exc)
 
 
 #

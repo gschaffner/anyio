@@ -30,6 +30,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   - Fixed ``Process.stdin.send()`` not raising ``BrokenResourceError`` on asyncio when
     ``Process.stdin.aclose()`` was called after the subprocess closed its standard
     input.
+  - Fixed various other streams on Trio nor raising ``BrokenResourceError`` after being
+    broken (i.e. closed by the peer or otherwise rendered unusable due to external
+    causes) and then closed
 
   (PR by Ganden Schaffner)
 
