@@ -930,7 +930,7 @@ class WorkerThread(Thread):
         workers: set[WorkerThread],
         idle_workers: deque[WorkerThread],
     ):
-        super().__init__(name="AnyIO worker thread")
+        super().__init__(name="AnyIO worker thread", daemon=True)
         self.root_task = root_task
         self.workers = workers
         self.idle_workers = idle_workers
