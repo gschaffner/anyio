@@ -52,6 +52,7 @@ from types import TracebackType
 from typing import (
     IO,
     Any,
+    Final,
     Optional,
     TypeVar,
     cast,
@@ -86,9 +87,9 @@ from ..lowlevel import RunVar
 from ..streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 if sys.version_info >= (3, 10):
-    from typing import ParamSpec
+    from typing import ParamSpec, TypeGuard
 else:
-    from typing_extensions import ParamSpec
+    from typing_extensions import ParamSpec, TypeGuard
 
 if sys.version_info >= (3, 11):
     from asyncio import Runner
@@ -344,8 +345,34 @@ def _task_started(task: asyncio.Task) -> bool:
 # Timeouts and cancellation
 #
 
+LEVEL_CANCELLATION_CANCEL_MESSAGE: Final = "Cancelled by an AnyIO cancel scope"
+
 
 class CancelScope(BaseCancelScope):
+    @staticmethod
+    def _is_level_cancellation_error(exc: BaseException) -> TypeGuard[CancelledError]:
+        if not isinstance(exc, CancelledError):
+            return False
+
+        # Sometimes third party frameworks catch a CancelledError and raise a new one,
+        # so as a workaround we have to look at the previous ones in __context__ too for
+        # a matching cancel message.
+        while True:
+            if LEVEL_CANCELLATION_CANCEL_MESSAGE in exc.args:
+                return True
+
+            if isinstance(exc.__context__, CancelledError):
+                exc = exc.__context__
+                continue
+
+            return False
+
+    @staticmethod
+    def _is_native_cancellation_error(exc: BaseException) -> TypeGuard[CancelledError]:
+        return isinstance(
+            exc, CancelledError
+        ) and not CancelScope._is_level_cancellation_error(exc)
+
     def __new__(
         cls, *, deadline: float = math.inf, shield: bool = False
     ) -> CancelScope:
@@ -397,12 +424,13 @@ class CancelScope(BaseCancelScope):
 
         return self
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> bool | None:
+    def _exit(self, exc: BaseException | None) -> BaseException | None:
+        # Analogous to Trio's CancelScope._close.
+        #
+        # This is implemented separately from __exit__ because TaskGroup.__aexit__ will
+        # call CancelScope._close instead of CancelScope.__exit__, as it's easier for
+        # TaskGroup.__aexit__ to work with exceptions than __exit__ return values.
+
         if not self._active:
             raise RuntimeError("This cancel scope is not active")
         if current_task() is not self._host_task:
@@ -431,29 +459,48 @@ class CancelScope(BaseCancelScope):
 
         host_task_state.cancel_scope = self._parent_scope
 
-        # We allow immediately raising CancelledError in the following cases:
-        # * exc_val is None (no exceptions were raised within this scope)
-        # * we caught and swallowed a CancelledError meant for this scope, and there are
-        #   no other exceptions being raised
-        not_swallowed_exceptions = 0
-        if exc_val is not None:
-            for exc in iterate_exceptions(exc_val):
-                if self._cancel_called and isinstance(exc, CancelledError):
-                    self._cancelled_caught = self._uncancel(exc)
-                    if not self._cancelled_caught:
-                        not_swallowed_exceptions += 1
-                else:
-                    not_swallowed_exceptions += 1
+        # We swallow level cancellation errors iff we have cancel_called and a cancelled
+        # parent is not visible from inside of us at the time of __exit__. See
+        # https://github.com/python-trio/trio/issues/860.
+        if (
+            exc is not None
+            and self._cancel_called
+            and (self._shield or not self._parent_cancelled())
+        ):
+            if self._is_level_cancellation_error(exc):
+                exc = None
+                self._cancelled_caught = True
+            elif isinstance(exc, BaseExceptionGroup):
+                matched, exc = exc.split(self._is_level_cancellation_error)
+                if matched:
+                    self._cancelled_caught = True
+
+            if self._cancelled_caught:
+                self._uncancel()
 
         # Restart the cancellation effort in the closest directly cancelled parent
         # scope if this one was shielded
-        self._restart_cancellation_in_parent(immediate=not not_swallowed_exceptions)
-        return self._cancelled_caught and not not_swallowed_exceptions
+        self._restart_cancellation_in_parent()
+        return exc
 
-    def _uncancel(self, cancelled_exc: CancelledError) -> bool:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool | None:
+        remaining_error_after_cancel_scope = self._exit(exc_val)
+        if remaining_error_after_cancel_scope is None:
+            return True
+        elif remaining_error_after_cancel_scope is exc_val:
+            return False
+        else:
+            raise remaining_error_after_cancel_scope
+
+    def _uncancel(self) -> None:
         if self._host_task is None:
             self._cancel_calls = 0
-            return True
+            return
 
         # Undo all cancellations done by this scope
         if self._cancelling is not None:
@@ -461,20 +508,6 @@ class CancelScope(BaseCancelScope):
                 self._cancel_calls -= 1
                 if self._host_task.uncancel() <= self._cancelling:
                     break
-
-        # Sometimes third party frameworks catch a CancelledError and raise a new one,
-        # so as a workaround we have to look at the previous ones in __context__ too
-        # for a matching cancel message
-        expected_cancel_message = f"Cancelled by cancel scope {id(self):x}"
-        while True:
-            if expected_cancel_message in cancelled_exc.args:
-                return True
-
-            if isinstance(cancelled_exc.__context__, CancelledError):
-                cancelled_exc = cancelled_exc.__context__
-                continue
-
-            return False
 
     def _timeout(self) -> None:
         if self._deadline != math.inf:
@@ -507,7 +540,7 @@ class CancelScope(BaseCancelScope):
                 waiter = task._fut_waiter  # type: ignore[attr-defined]
                 if not isinstance(waiter, asyncio.Future) or not waiter.done():
                     origin._cancel_calls += 1
-                    task.cancel(f"Cancelled by cancel scope {id(origin):x}")
+                    task.cancel(LEVEL_CANCELLATION_CANCEL_MESSAGE)
 
         # Deliver cancellation to child scopes that aren't shielded or running their own
         # cancellation callbacks
@@ -526,7 +559,7 @@ class CancelScope(BaseCancelScope):
 
         return should_retry
 
-    def _restart_cancellation_in_parent(self, immediate: bool = False) -> None:
+    def _restart_cancellation_in_parent(self) -> None:
         """
         Restart the cancellation effort in the closest directly cancelled parent scope.
 
@@ -535,8 +568,7 @@ class CancelScope(BaseCancelScope):
         while scope is not None:
             if scope._cancel_called:
                 if scope._cancel_handle is None:
-                    if scope._deliver_cancellation(scope) and immediate:
-                        raise CancelledError(f"Cancelled by cancel scope {id(scope):x}")
+                    scope._deliver_cancellation(scope)
 
                 break
 
@@ -673,40 +705,96 @@ class TaskGroup(abc.TaskGroup):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool | None:
-        if exc_val is not None:
-            self.cancel_scope.cancel()
-            if not isinstance(exc_val, CancelledError):
-                self._exceptions.append(exc_val)
-
-        try:
-            # Wait for child tasks to finish in a shielded scope, to prevent the
-            # enclosing cancel scope from hammering this task with cancellation attempts
-            # (#695)
-            with CancelScope(shield=True):
-                while self._tasks:
-                    try:
-                        await asyncio.wait(self._tasks)
-                    except CancelledError as exc:
-                        # This task was cancelled natively; reraise the CancelledError later
-                        # unless this task was already interrupted by another exception
-                        self.cancel_scope.cancel()
-                        if exc_val is None:
-                            exc_val = exc
-
-                self._active = False
-                if self._exceptions:
-                    raise BaseExceptionGroup(
-                        "unhandled errors in a TaskGroup", self._exceptions
-                    )
-                elif exc_val:
-                    raise exc_val
-        except BaseException as exc:
-            if self.cancel_scope.__exit__(type(exc), exc, exc.__traceback__):
+        # If we see a native cancellation in the host task, including one that occurs
+        # while waiting for the child tasks to finish, we'll reraise it only if there is
+        # nothing else to raise.
+        (exc_group, host_task_native_exc) = await self._wait_children_finished(exc_val)
+        combined_error_from_task_group = self.cancel_scope._exit(exc_group)
+        if combined_error_from_task_group is None:
+            if host_task_native_exc is None:
                 return True
+            elif host_task_native_exc is exc_val:
+                return False
+            else:
+                raise host_task_native_exc
+        else:
+            combined_error_from_task_group = (
+                self._consolidate_level_cancellation_errors(
+                    combined_error_from_task_group
+                )
+            )
+            if combined_error_from_task_group is exc_val:
+                return False
+            else:
+                # This shows up in tracebacks so it must have a clear name.
+                raise combined_error_from_task_group
 
-            raise
+    async def _wait_children_finished(
+        self, host_task_exc: BaseException | None
+    ) -> tuple[BaseExceptionGroup | None, CancelledError | None]:
+        # Analogous to Trio's Nursery._nested_child_finished.
 
-        return self.cancel_scope.__exit__(exc_type, exc_val, exc_tb)
+        host_task_native_exc: CancelledError | None = None
+        if host_task_exc is not None:
+            if not self._add_exception(host_task_exc):
+                assert isinstance(host_task_exc, CancelledError)
+                host_task_native_exc = host_task_exc
+
+        # Wait for child tasks to finish in a shielded scope, to prevent the enclosing
+        # cancel scope from hammering this task with cancellation attempts (#695)
+        with CancelScope(shield=True):
+            while True:
+                try:
+                    # We must pass a schedule point in this function, even if the only
+                    # unfinished task in the group is the host task.
+                    if self._tasks:
+                        await asyncio.wait(self._tasks)
+                    else:
+                        await AsyncIOBackend.checkpoint()
+                except CancelledError as exc:
+                    # The host task was cancelled natively. Keep waiting if there are
+                    # tasks to wait for, but save the native exception in case we need
+                    # to raise it later.
+                    self.cancel_scope.cancel()
+                    host_task_native_exc = exc
+
+                if not self._tasks:
+                    break
+
+        self._active = False
+        if self._exceptions:
+            exc_group = BaseExceptionGroup(
+                "unhandled errors in a TaskGroup", self._exceptions
+            )
+        else:
+            exc_group = None
+        return (exc_group, host_task_native_exc)
+
+    @staticmethod
+    def _consolidate_level_cancellation_errors(exc: BaseException) -> BaseException:
+        # Something that Trio does not do, but AnyIO does, is consolidate an exception
+        # group that contains only level cancellation errors.
+        if isinstance(exc, BaseExceptionGroup):
+            _, rest = exc.split(CancelScope._is_level_cancellation_error)
+            if not rest:
+                cancelled_exc = CancelledError(LEVEL_CANCELLATION_CANCEL_MESSAGE)
+                cancelled_exc.__cause__ = exc
+                return cancelled_exc
+
+        return exc
+
+    def _add_exception(self, exc: BaseException) -> bool:
+        # Analogous to Trio's `Nursery._add_exc`.
+        #
+        # Native cancellation exceptions must not make their way into the exception
+        # group. (Unlike a level cancellation error, a native cancellation error is
+        # associated with a particular task. asyncio looks at native cancellations to
+        # determine `task.cancelled()`, and it does not look inside exception groups.)
+        if added := not CancelScope._is_native_cancellation_error(exc):
+            self._exceptions.append(exc)
+
+        self.cancel_scope.cancel()
+        return added
 
     def _spawn(
         self,
@@ -726,24 +814,18 @@ class TaskGroup(abc.TaskGroup):
             try:
                 exc = _task.exception()
             except CancelledError as e:
-                while isinstance(e.__context__, CancelledError):
-                    e = e.__context__
-
                 exc = e
 
             if exc is not None:
-                # The future can only be in the cancelled state if the host task was
-                # cancelled, so return immediately instead of adding one more
-                # CancelledError to the exceptions list
+                # The future can only be in the cancelled state if the start() call was
+                # cancelled. If the start() call was cancelled, start() either raised
+                # the task's exception or raised cancelled, so we should not add it to
+                # the exceptions list.
                 if task_status_future is not None and task_status_future.cancelled():
                     return
 
                 if task_status_future is None or task_status_future.done():
-                    if not isinstance(exc, CancelledError):
-                        self._exceptions.append(exc)
-
-                    if not self.cancel_scope._parent_cancelled():
-                        self.cancel_scope.cancel()
+                    self._add_exception(exc)
                 else:
                     task_status_future.set_exception(exc)
             elif task_status_future is not None and not task_status_future.done():
@@ -805,9 +887,9 @@ class TaskGroup(abc.TaskGroup):
         # scope here.
         try:
             return await future
-        except CancelledError:
+        except CancelledError as exc:
             # Cancel the task and wait for it to exit before returning
-            task.cancel()
+            task.cancel(*exc.args)
             with CancelScope(shield=True), suppress(CancelledError):
                 await task
 
@@ -2200,7 +2282,7 @@ class AsyncIOBackend(AsyncBackend):
         scope: CancelScope | None = threadlocals.current_cancel_scope
         while scope is not None:
             if scope.cancel_called:
-                raise CancelledError(f"Cancelled by cancel scope {id(scope):x}")
+                raise CancelledError(LEVEL_CANCELLATION_CANCEL_MESSAGE)
 
             if scope.shield:
                 return
