@@ -704,6 +704,9 @@ class TaskGroup(abc.TaskGroup):
             else:
                 raise host_task_native_exc
         else:
+            if host_task_native_exc is not None and sys.version_info >= (3, 11):
+                cast(asyncio.Task, current_task()).uncancel()
+
             combined_error_from_task_group = (
                 self._consolidate_level_cancellation_errors(
                     combined_error_from_task_group
@@ -741,6 +744,9 @@ class TaskGroup(abc.TaskGroup):
                     # The host task was cancelled natively. Keep waiting if there are
                     # tasks to wait for, but save the native exception in case we need
                     # to raise it later.
+                    if host_task_native_exc is not None and sys.version_info >= (3, 11):
+                        cast(asyncio.Task, current_task()).uncancel()
+
                     self.cancel_scope.cancel()
                     host_task_native_exc = exc
 
