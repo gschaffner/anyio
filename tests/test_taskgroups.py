@@ -705,20 +705,22 @@ async def test_cancelled_not_caught() -> None:
     assert not scope.cancelled_caught
 
 
-async def test_cancelled_raises_beyond_origin() -> None:
+@pytest.mark.parametrize("shield_inner", [False, True])
+async def test_cancelled_raises_beyond_origin(shield_inner: bool) -> None:
     """Regression test for #698."""
     with CancelScope() as outer_scope:
-        with CancelScope() as inner_scope:
+        with CancelScope(shield=shield_inner) as inner_scope:
             inner_scope.cancel()
             try:
                 await checkpoint()
             finally:
                 outer_scope.cancel()
             pytest.fail("checkpoint should have raised")
-        pytest.fail("inner_scope should not have caught cancelled")
+        if not shield_inner:
+            pytest.fail("inner_scope should not have caught cancelled")
 
-    assert not inner_scope.cancelled_caught
-    assert outer_scope.cancelled_caught
+    assert inner_scope.cancelled_caught == shield_inner
+    assert outer_scope.cancelled_caught != shield_inner
 
 
 @pytest.mark.parametrize("anyio_backend", ["asyncio"])
