@@ -26,7 +26,6 @@ from collections.abc import (
     Callable,
     Collection,
     Coroutine,
-    Generator,
     Iterable,
     Mapping,
     Sequence,
@@ -390,8 +389,6 @@ class CancelScope(BaseCancelScope):
         self._cancel_handle: asyncio.Handle | None = None
         self._tasks: set[asyncio.Task] = set()
         self._host_task: asyncio.Task | None = None
-        self._cancel_calls: int = 0
-        self._cancelling: int | None = None
 
     def __enter__(self) -> CancelScope:
         if self._active:
@@ -415,8 +412,6 @@ class CancelScope(BaseCancelScope):
 
         self._timeout()
         self._active = True
-        if sys.version_info >= (3, 11):
-            self._cancelling = self._host_task.cancelling()
 
         # Start cancelling the host task if the scope was cancelled before entering
         if self._cancel_called:
@@ -499,15 +494,14 @@ class CancelScope(BaseCancelScope):
 
     def _uncancel(self) -> None:
         if self._host_task is None:
-            self._cancel_calls = 0
             return
 
-        # Undo all cancellations done by this scope
-        if self._cancelling is not None:
-            while self._cancel_calls:
-                self._cancel_calls -= 1
-                if self._host_task.uncancel() <= self._cancelling:
-                    break
+        # Undo all level cancellations swallowed by this scope
+        if sys.version_info >= (3, 11):
+            host_task_state = _task_states[self._host_task]
+            while host_task_state.uncancellations_needed:
+                self._host_task.uncancel()
+                host_task_state.uncancellations_needed -= 1
 
     def _timeout(self) -> None:
         if self._deadline != math.inf:
@@ -539,8 +533,9 @@ class CancelScope(BaseCancelScope):
             if task is not current and (task is self._host_task or _task_started(task)):
                 waiter = task._fut_waiter  # type: ignore[attr-defined]
                 if not isinstance(waiter, asyncio.Future) or not waiter.done():
-                    origin._cancel_calls += 1
                     task.cancel(LEVEL_CANCELLATION_CANCEL_MESSAGE)
+                    if task is self._host_task and sys.version_info >= (3, 11):
+                        _task_states[task].uncancellations_needed += 1
 
         # Deliver cancellation to child scopes that aren't shielded or running their own
         # cancellation callbacks
@@ -644,11 +639,12 @@ class TaskState:
     itself because there are no guarantees about its implementation.
     """
 
-    __slots__ = "parent_id", "cancel_scope", "__weakref__"
+    __slots__ = "parent_id", "cancel_scope", "uncancellations_needed", "__weakref__"
 
     def __init__(self, parent_id: int | None, cancel_scope: CancelScope | None):
         self.parent_id = parent_id
         self.cancel_scope = cancel_scope
+        self.uncancellations_needed = 0
 
 
 _task_states: WeakKeyDictionary[asyncio.Task, TaskState] = WeakKeyDictionary()
@@ -675,16 +671,6 @@ class _AsyncioTaskStatus(abc.TaskStatus):
 
         task = cast(asyncio.Task, current_task())
         _task_states[task].parent_id = self._parent_id
-
-
-def iterate_exceptions(
-    exception: BaseException,
-) -> Generator[BaseException, None, None]:
-    if isinstance(exception, BaseExceptionGroup):
-        for exc in exception.exceptions:
-            yield from iterate_exceptions(exc)
-    else:
-        yield exception
 
 
 class TaskGroup(abc.TaskGroup):
