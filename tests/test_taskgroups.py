@@ -738,6 +738,22 @@ async def test_deadline_based_checkpoint() -> None:
     assert outer_scope.cancelled_caught
 
 
+async def test_cancelled_scope_based_checkpoint() -> None:
+    """Regression test closely related to #698."""
+    with CancelScope() as outer_scope:
+        outer_scope.cancel()
+        # The following two lines are a way to implement a checkpoint function. See also
+        # https://github.com/python-trio/trio/issues/860.
+        with CancelScope() as inner_scope:
+            inner_scope.cancel()
+            await sleep_forever()
+        pytest.fail("checkpoint should have raised")
+
+    assert inner_scope is not None
+    assert not inner_scope.cancelled_caught
+    assert outer_scope.cancelled_caught
+
+
 @pytest.mark.parametrize("anyio_backend", ["asyncio"])
 async def test_cancel_host_asyncgen() -> None:
     done = False
