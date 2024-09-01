@@ -4,7 +4,8 @@ import asyncio
 import math
 import sys
 import time
-from collections.abc import AsyncGenerator, Coroutine, Generator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any, NoReturn, cast
 
 import pytest
@@ -33,6 +34,27 @@ if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup, ExceptionGroup
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def check_origin(
+    anyio_backend_name: str,
+) -> Callable[[CancelScope], AbstractContextManager[None]]:
+    # Note that Trio does not associate each Cancelled with a particular "origin" scope
+    # (https://github.com/python-trio/trio/issues/860). The asyncio backend does,
+    # however. In some tests we make extra checks of the asyncio backend's internal
+    # understanding of a CancelledError's "origin" scope.
+
+    @contextmanager
+    def check_origin(expected: CancelScope) -> Generator[None]:
+        try:
+            yield
+        except get_cancelled_exc_class() as exc:
+            if anyio_backend_name == "asyncio":
+                assert f"Cancelled by cancel scope {id(expected):x}" in exc.args
+            raise
+
+    return check_origin
 
 
 async def async_error(text: str, delay: float = 0.1) -> NoReturn:
@@ -706,13 +728,17 @@ async def test_cancelled_not_caught() -> None:
 
 
 @pytest.mark.parametrize("shield_inner", [False, True])
-async def test_cancelled_raises_beyond_origin(shield_inner: bool) -> None:
+async def test_cancelled_raises_beyond_origin(
+    shield_inner: bool,
+    check_origin: Callable[[CancelScope], AbstractContextManager[None]],
+) -> None:
     """Regression test for #698."""
-    with CancelScope() as outer_scope:
-        with CancelScope(shield=shield_inner) as inner_scope:
+    with CancelScope() as outer_scope, check_origin(outer_scope):
+        with CancelScope(shield=shield_inner) as inner_scope, check_origin(inner_scope):
             inner_scope.cancel()
             try:
-                await checkpoint()
+                with check_origin(inner_scope):
+                    await checkpoint()
             finally:
                 outer_scope.cancel()
             pytest.fail("checkpoint should have raised")
@@ -723,9 +749,11 @@ async def test_cancelled_raises_beyond_origin(shield_inner: bool) -> None:
     assert outer_scope.cancelled_caught != shield_inner
 
 
-async def test_deadline_based_checkpoint() -> None:
+async def test_deadline_based_checkpoint(
+    check_origin: Callable[[CancelScope], AbstractContextManager[None]],
+) -> None:
     """Regression test closely related to #698."""
-    with CancelScope() as outer_scope:
+    with CancelScope() as outer_scope, check_origin(outer_scope):
         outer_scope.cancel()
         # The following two lines are a way to implement a checkpoint function. See also
         # https://github.com/python-trio/trio/pull/835#issuecomment-455107324.
@@ -738,9 +766,11 @@ async def test_deadline_based_checkpoint() -> None:
     assert outer_scope.cancelled_caught
 
 
-async def test_cancelled_scope_based_checkpoint() -> None:
+async def test_cancelled_scope_based_checkpoint(
+    check_origin: Callable[[CancelScope], AbstractContextManager[None]],
+) -> None:
     """Regression test closely related to #698."""
-    with CancelScope() as outer_scope:
+    with CancelScope() as outer_scope, check_origin(outer_scope):
         outer_scope.cancel()
         # The following two lines are a way to implement a checkpoint function. See also
         # https://github.com/python-trio/trio/issues/860.
