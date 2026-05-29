@@ -81,7 +81,7 @@ from .._core._synchronization import (
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
 from .._core._tasks import CancelScope as BaseCancelScope
-from .._core._tasks import TaskHandle
+from .._core._tasks import StartTaskHandle, TaskHandle
 from ..abc import IPSockAddrType, UDPPacketType, UNIXDatagramPacketType
 from ..abc._eventloop import AsyncBackend, StrOrBytesPath
 from ..abc._tasks import get_callable_name
@@ -241,15 +241,15 @@ class TaskGroup(abc.TaskGroup):
         *args: object,
         name: object = None,
         return_handle: Literal[False] | Literal[True] = False,
-    ) -> Any:
-        handle: TaskHandle[T_co]
+    ) -> Any | StartTaskHandle[Any, T_co]:
+        handle: StartTaskHandle[Any, T_co]
 
         async def run_coro_with_task_status(
             *, task_status: trio.TaskStatus[Any]
         ) -> None:
             nonlocal handle
             coro = func(*args, task_status=task_status)
-            handle = TaskHandle(coro, name)
+            handle = StartTaskHandle(coro, name)
             await handle._run_coro()
 
         self._check_active()

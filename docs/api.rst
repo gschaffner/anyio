@@ -42,6 +42,7 @@ Task groups
 
 .. autofunction:: anyio.create_task_group
 .. autoclass:: anyio.TaskHandle
+.. autoclass:: anyio.StartTaskHandle
 
 .. autoclass:: anyio.abc.TaskGroup
 .. autoclass:: anyio.abc.TaskStatus

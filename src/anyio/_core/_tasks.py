@@ -12,7 +12,7 @@ from contextlib import (
 from contextvars import ContextVar
 from enum import Enum, auto
 from types import TracebackType
-from typing import Any, Generic, TypeVar, final
+from typing import Any, Generic, TypeVar
 
 from ..abc import TaskGroup, TaskStatus
 from ._eventloop import get_async_backend, get_cancelled_exc_class
@@ -24,7 +24,8 @@ else:
     from typing_extensions import TypeVarTuple
 
 T = TypeVar("T")
-T_co = TypeVar("T_co", covariant=True)
+ReturnT_co = TypeVar("ReturnT_co", covariant=True)
+StartT_co = TypeVar("StartT_co", covariant=True)
 PosArgsT = TypeVarTuple("PosArgsT")
 
 _current_task_handle: ContextVar[TaskHandle] = ContextVar("_current_task_handle")
@@ -194,8 +195,7 @@ def create_task_group() -> TaskGroup:
     return get_async_backend().create_task_group()
 
 
-@final
-class TaskHandle(Generic[T_co]):
+class TaskHandle(Generic[ReturnT_co]):
     """
     Returned from :meth:`TaskGroup.create_task() <.abc.TaskGroup.create_task>`.
     Can be awaited on to get the return value of the task (or the raised exception).
@@ -239,14 +239,12 @@ class TaskHandle(Generic[T_co]):
         "_cancel_scope",
         "_finished_event",
         "_return_value",
-        "_start_value",
         "_exception",
     )
 
-    _return_value: T_co
-    _start_value: Any
+    _return_value: ReturnT_co
 
-    def __init__(self, coro: Coroutine[Any, Any, T_co], name: object) -> None:
+    def __init__(self, coro: Coroutine[Any, Any, ReturnT_co], name: object) -> None:
         from ._synchronization import Event
 
         if not isinstance(coro, Coroutine):
@@ -290,7 +288,7 @@ class TaskHandle(Generic[T_co]):
             self._cancel_scope.cancel()
 
     @property
-    def coro(self) -> Coroutine[Any, Any, T_co]:
+    def coro(self) -> Coroutine[Any, Any, ReturnT_co]:
         """The coroutine object that was passed to :meth:`TaskGroup.create_task`."""
         return self._coro
 
@@ -347,7 +345,7 @@ class TaskHandle(Generic[T_co]):
                 return self._exception
 
     @property
-    def return_value(self) -> T_co:
+    def return_value(self) -> ReturnT_co:
         """
         The return value of the task.
 
@@ -368,15 +366,6 @@ class TaskHandle(Generic[T_co]):
             case TaskHandle.Status.FAILED:
                 raise TaskFailed("the task raised an exception") from self._exception
 
-    @property
-    def start_value(self) -> Any:
-        try:
-            return self._start_value
-        except AttributeError:
-            raise RuntimeError(
-                "the task was not started with TaskGroup.start()"
-            ) from None
-
     async def wait(self) -> None:
         """
         Wait for the task to finish.
@@ -386,7 +375,7 @@ class TaskHandle(Generic[T_co]):
         """
         await self._finished_event.wait()
 
-    def __await__(self) -> Generator[Any, Any, T_co]:
+    def __await__(self) -> Generator[Any, Any, ReturnT_co]:
         yield from self._finished_event.wait().__await__()
         return self.return_value
 
@@ -395,3 +384,13 @@ class TaskHandle(Generic[T_co]):
             f"<{self.__class__.__name__} {self.status.name.lower()} "
             f"name={self._name!r} coro={self._coro!r}>"
         )
+
+
+class StartTaskHandle(TaskHandle[ReturnT_co], Generic[StartT_co, ReturnT_co]):
+    __slots__ = ("_start_value",)
+
+    _start_value: StartT_co
+
+    @property
+    def start_value(self) -> StartT_co:
+        return self._start_value

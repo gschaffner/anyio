@@ -56,6 +56,7 @@ from typing import (
     ParamSpec,
     TypeVar,
     cast,
+    overload,
 )
 from weakref import WeakKeyDictionary
 
@@ -92,7 +93,7 @@ from .._core._synchronization import (
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
 from .._core._tasks import CancelScope as BaseCancelScope
-from .._core._tasks import TaskHandle
+from .._core._tasks import StartTaskHandle, TaskHandle
 from ..abc import (
     AsyncBackend,
     IPSockAddrType,
@@ -304,6 +305,7 @@ T_co = TypeVar("T_co", covariant=True)
 T_contra = TypeVar("T_contra", contravariant=True)
 PosArgsT = TypeVarTuple("PosArgsT")
 P = ParamSpec("P")
+StartT_co = TypeVar("StartT_co", covariant=True)
 
 _root_task: RunVar[asyncio.Task | None] = RunVar("_root_task")
 
@@ -811,12 +813,21 @@ class TaskGroup(abc.TaskGroup):
         finally:
             del exc_val, exc_tb, self._exceptions
 
+    @overload
+    def _spawn(self, handle: TaskHandle[T_co]) -> None: ...
+
+    @overload
     def _spawn(
         self,
-        coro: Coroutine[Any, Any, T_co],
-        name: object,
-        task_status_future: asyncio.Future | None = None,
-    ) -> TaskHandle[T_co]:
+        handle: StartTaskHandle[StartT_co, T_co],
+        task_status_future: asyncio.Future[StartT_co],
+    ) -> None: ...
+
+    def _spawn(
+        self,
+        handle: TaskHandle[T_co],
+        task_status_future: asyncio.Future[Any] | None = None,
+    ) -> None:
         def task_done(_task: asyncio.Task) -> None:
             if sys.version_info >= (3, 14) and self.cancel_scope._host_task is not None:
                 asyncio.future_discard_from_awaited_by(
@@ -869,7 +880,6 @@ class TaskGroup(abc.TaskGroup):
         else:
             parent_id = id(self.cancel_scope._host_task)
 
-        handle = TaskHandle(coro, name)
         loop = asyncio.get_running_loop()
         wrapper_coro = handle._run_coro()
         if (
@@ -892,7 +902,6 @@ class TaskGroup(abc.TaskGroup):
             asyncio.future_add_to_awaited_by(task, self.cancel_scope._host_task)
 
         task.add_done_callback(task_done)
-        return handle
 
     def create_task(
         self,
@@ -910,10 +919,13 @@ class TaskGroup(abc.TaskGroup):
                 "This task group is not active; no new tasks can be started."
             )
 
+        handle = TaskHandle(coro, name)
         if context is not None:
-            return context.run(partial(self._spawn, coro, name=name))
+            context.run(self._spawn, handle)
         else:
-            return self._spawn(coro, name=name)
+            self._spawn(handle)
+
+        return handle
 
     async def start(
         self,
@@ -921,12 +933,13 @@ class TaskGroup(abc.TaskGroup):
         *args: Unpack[PosArgsT],
         name: object = None,
         return_handle: Literal[False] | Literal[True] = False,
-    ) -> Any:
+    ) -> Any | StartTaskHandle[Any, T_co]:
         future: asyncio.Future = asyncio.Future()
         final_name = get_callable_name(func, name)
         task_status = _AsyncioTaskStatus(future, id(self.cancel_scope._host_task))
         coro = call_for_coroutine(func, args, task_status=task_status)
-        handle = self._spawn(coro, final_name, future)
+        handle = StartTaskHandle[Any, T_co](coro, final_name)
+        self._spawn(handle, future)
 
         # If the task raises an exception after sending a start value without a switch
         # point between, the task group is cancelled and this method never proceeds to

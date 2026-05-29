@@ -18,7 +18,7 @@ else:
     from typing_extensions import TypeVarTuple, Unpack
 
 if TYPE_CHECKING:
-    from .._core._tasks import CancelScope, TaskHandle
+    from .._core._tasks import CancelScope, StartTaskHandle, TaskHandle
 
 T_co = TypeVar("T_co", covariant=True)
 T_contra = TypeVar("T_contra", contravariant=True, default=None)
@@ -159,7 +159,7 @@ class TaskGroup(metaclass=ABCMeta):
         *args: object,
         name: object = None,
         return_handle: Literal[True],
-    ) -> TaskHandle[T_co]: ...
+    ) -> StartTaskHandle[Any, T_co]: ...
 
     @abstractmethod
     async def start(
